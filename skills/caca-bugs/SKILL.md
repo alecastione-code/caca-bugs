@@ -27,6 +27,19 @@ brakes. It is built to be safer and to see more:
 4. **No customer data in reports.** Reports carry routes, terms, counts, HTTP statuses and
    timings. They never carry names, orders, e-mails, cookies or tokens.
 
+## Lesson learned: a sweep can take production down
+
+In the first real run, re-checking one heavy page took the production server down for several
+minutes until the sweep was stopped. The page fired eight 30 s+ reads in parallel. Since then:
+
+- the sweep checks the health endpoint every 4 s WHILE each page loads, and stops everything at
+  once if it gets slow;
+- the culprit page is reported as critical (`derruba_servidor`), because a normal user can freeze
+  the server the same way;
+- the pause between pages is 1.5 s;
+- full sweeps run off-peak. During business hours, sweep only a few pages (`so`) and watch the
+  health endpoint.
+
 ## Non-negotiable rules
 
 - In production, read-only. Never write to the database or third-party APIs to "see what
@@ -47,7 +60,8 @@ brakes. It is built to be safer and to see more:
    `rotas: [{ id, ir: () => router.push('/x') }]`.
 3. Paste `scripts/sweep.js` into the browser tool. It starts in the background and answers at
    once, because many browser tools time out at around 45 s.
-4. Paste `scripts/status.js` to read progress. At the end it returns the summary, problems per
+4. Paste `scripts/status.js` to read progress. A full sweep of a 70-page app takes 20-35 min, so
+   wait in the background between checks. At the end it returns the summary, problems per
    page and the pages that passed.
 5. **Mobile:** set a 390 px viewport, reload, and sweep the main routes again.
 
@@ -66,13 +80,24 @@ It checks, per page and per clicked tab:
 | Request over 5 s | lenta |
 | Blocked write attempts | logged, not a bug |
 
+**Self-brake:** set `saude: '/health'` (any cheap endpoint). Before each page the sweep measures
+it. If it is slower than `lentoMs` (3 s), the sweep waits 10 s and retries. After 3 slow tries it
+stops and marks the run as `freada`. It also waits `pausaEntre` (0.4 s) between pages, and pages
+that never settled get no tab clicks. A full sweep of heavy pages can slow a small production
+server on its own.
+
 ## Step 2: Server sweep (host logs)
 
 Using your host's log tool (Railway, Render, Fly, Vercel, CloudWatch…), over the last 6-24 h:
 
 - Count HTTP 5xx and 499 by path. A 499 is the client giving up, which almost always means a slow
   read. Note the requests that took more than 5 s.
-- Find bursts of 5xx that line up with deploys: they are restarts, not bugs.
+- **Drop deploy windows:** list the deploys and discard 502/503 within about 5 min after each one.
+  In the first real run, 95% of the 5xx were restarts.
+- **Big log answers:** group with `jq` (status + path with numbers replaced by `#`, then count)
+  instead of reading raw lines.
+- **Deliberate 500/503:** webhooks that answer 500/503 on purpose so the platform retries are
+  still a bug signal. The usual cause is a write lock or a slow queue.
 - Group application errors by message, with numbers and ids replaced by `#`.
 - For "slow for one tenant only", measure the same read for two tenants in a read-only mode.
   Queueing behind a heavy tenant looks exactly like a slow query.
@@ -96,6 +121,10 @@ The health score follows gstack's rubric, adapted:
 - Weights: functional 25%, data 20%, server 15%, console 15%, performance 10%, visual 10%,
   content 5%.
 - Untested categories are left out and the score is marked partial.
+
+**Automatic report:** put server findings in
+`window.__servidor = [{id, tipo, rota, severidade, n}]` and paste `scripts/report.js`. It dedupes by
+root cause, computes the score and returns the markdown and the baseline.
 
 Write `qa/YYYYMMDD-HHMM/report.md` with the score, the top 3, the bug table and what was not
 covered. Also write `qa/YYYYMMDD-HHMM/baseline.json`, so the next run reports what was fixed,

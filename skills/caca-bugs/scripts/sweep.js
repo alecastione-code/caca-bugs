@@ -17,7 +17,7 @@
 if (window.__varreduraRodando) { 'já existe uma varredura rodando: ' + window.__varreduraProgresso; } else {
 window.__varreduraRodando = true; window.__varredura = null;
 window.__varreduraPromessa = (async () => {
-  const opts = Object.assign({ esperaMax: 30000, quieto: 1500, abas: true, maxAbas: 6, continuas: /\/events\b|\/live\b|stream|sse/i }, window.__varreduraOpcoes || {});
+  const opts = Object.assign({ esperaMax: 30000, quieto: 1500, abas: true, maxAbas: 6, maxPorPagina: 45000, saude: null, lentoMs: 3000, pausaEntre: 1500, continuas: /\/events\b|\/live\b|stream|sse/i }, window.__varreduraOpcoes || {});
   // ---------- routes ----------
   function descobre() {
     const vistos = new Set(), lista = [];
@@ -73,10 +73,40 @@ window.__varreduraPromessa = (async () => {
   addEventListener('error', onErr); addEventListener('unhandledrejection', onRej);
 
   const dorme = ms => new Promise(r => setTimeout(r, ms));
-  async function assenta() { // espera a rede ficar quieta ou estourar o tempo
-    const t0 = performance.now(); await dorme(300);
+  // Freio próprio: a varredura não pode derrubar o app que está medindo. Antes de cada página,
+  // mede o endpoint de saúde (opts.saude, ex.: '/readyz'); se passar de lentoMs, espera e tenta
+  // de novo; depois de 3 tentativas lentas, para e marca a varredura como "freada".
+  const freios = [];
+  async function respira(id) {
+    if (!opts.saude) return true;
+    for (let i = 0; i < 4; i++) {
+      const t0 = performance.now(); let ok = false;
+      try { ok = (await fOrig(opts.saude, { cache: 'no-store' })).ok; } catch {}
+      const ms = Math.round(performance.now() - t0);
+      if (ok && ms <= opts.lentoMs) return true;
+      freios.push({ antes: id, ms, ok });
+      if (i < 3) await dorme(10000);
+    }
+    return false;
+  }
+  // Lição de 04/11: o freio entre páginas não basta. Uma página pesada (várias leituras de 30 s+
+  // em paralelo) travou o servidor de produção para todo mundo DURANTE a espera. Agora, enquanto
+  // espera, a varredura mede a saúde a cada 4 s; se ficar lenta, aborta a página e a varredura
+  // inteira na hora (`derrubando`), e o relatório marca essa página como "pesada demais".
+  let derrubando = null;
+  async function vigiaSaude(id) {
+    if (!opts.saude) return true;
+    const t0 = performance.now(); let ok = false;
+    try { ok = (await fOrig(opts.saude, { cache: 'no-store', signal: AbortSignal.timeout(opts.lentoMs + 500) })).ok; } catch {}
+    const ms = Math.round(performance.now() - t0);
+    if (ok && ms <= opts.lentoMs) return true;
+    derrubando = { pagina: id, ms }; freios.push({ durante: id, ms, ok }); return false;
+  }
+  async function assenta(id) { // espera a rede ficar quieta, estourar o tempo ou a saúde cair
+    const t0 = performance.now(); await dorme(300); let ultimaSaude = performance.now();
     while (performance.now() - t0 < opts.esperaMax) {
       if (pendentes === 0 && performance.now() - ultimoMovimento > opts.quieto) return Math.round(performance.now() - t0);
+      if (performance.now() - ultimaSaude > 4000) { ultimaSaude = performance.now(); if (!(await vigiaSaude(id))) return -2; }
       await dorme(200);
     }
     return -1; // estourou
@@ -116,7 +146,7 @@ window.__varreduraPromessa = (async () => {
     for (const a of abas) {
       const nome = (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 30); const antes = erros.length;
       try { a.click(); } catch { continue; }
-      const ms = await assenta(); const r = inspeciona({ title: nome });
+      const ms = await assenta(nome); if (ms === -2) break; const r = inspeciona({ title: nome });
       res.push({ aba: nome, ms, achados: r.achados, errosConsole: erros.slice(antes) });
     }
     return res;
@@ -128,11 +158,15 @@ window.__varreduraPromessa = (async () => {
   try {
   for (const p of paginas) {
     window.__varreduraProgresso = `${++n}/${paginas.length} ${p.id}`;
+    if (!(await respira(p.id))) { resultado.freada = `servidor lento antes de ${p.id}`; break; }
+    if (n > 1) await dorme(opts.pausaEntre);
     const iRede = rede.length, iErr = erros.length; const t0 = performance.now();
     try { navega(p); } catch (e) { resultado.paginas.push({ id: p.id, erroNavegar: String(e.message).slice(0, 120) }); continue; }
-    const ms = await assenta();
+    const ms = await assenta(p.id);
+    if (ms === -2) { resultado.freada = `servidor ficou lento DURANTE ${p.id}: varredura parada para não derrubar o app`; resultado.paginas.push({ id: p.id, pesadaDemais: true, estourou: true, msAteAssentar: -2, achados: [{ tipo: 'derruba_servidor', severidade: 'critica', termo: 'saúde ' + derrubando.ms + 'ms durante a página' }] }); try { location.hash = hashOriginal; } catch {} break; }
     const tela = inspeciona(p);
-    const abas = await clicaAbas();
+    // Página que estourou não tem as abas clicadas: só multiplicaria a espera.
+    const abas = ms === -1 || performance.now() - t0 > opts.maxPorPagina ? [] : await clicaAbas();
     const req = rede.slice(iRede);
     resultado.paginas.push({
       id: p.id, titulo: tela.titulo, hash: (location.hash || location.pathname).slice(0, 80),
@@ -144,6 +178,8 @@ window.__varreduraPromessa = (async () => {
       redeLentas: req.filter(r => r.ms > 5000 && !r.continua && !r.falha && !(r.status >= 400)).map(r => `${r.metodo} ${r.url} ${r.ms}ms`),
       escritasBloqueadas: req.filter(r => r.bloqueado).map(r => `${r.metodo} ${r.url}`),
       requisicoes: req.length,
+      // Página que não assenta quase sempre tem uma chamada repetindo sem parar: mostra quais.
+      maisChamadas: ms === -1 ? Object.entries(req.reduce((c, r) => (c[r.url] = (c[r.url] || 0) + 1, c), {})).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([u, k]) => u + ' x' + k) : undefined,
     });
   }
   } finally { // ---------- restaura SEMPRE, mesmo se algo falhar no meio ----------
@@ -153,7 +189,8 @@ window.__varreduraPromessa = (async () => {
   }
 
   const comProblema = resultado.paginas.filter(p => p.estourou || p.achados?.length || p.errosConsole?.length || p.redeFalhas?.length || p.redeLentas?.length || p.abas?.some(a => a.achados.length || a.errosConsole.length));
-  resultado.resumo = { paginas: resultado.paginas.length, comProblema: comProblema.length, estouraram: resultado.paginas.filter(p => p.estourou).length };
+  resultado.freios = freios;
+  resultado.resumo = { paginas: resultado.paginas.length, de: paginas.length, comProblema: comProblema.length, estouraram: resultado.paginas.filter(p => p.estourou).length, freada: resultado.freada || null, escritasBloqueadas: resultado.paginas.reduce((s, p) => s + (p.escritasBloqueadas || []).length, 0) };
   window.__varredura = resultado; window.__varreduraRodando = false; window.__varreduraProgresso = 'pronta';
   return JSON.stringify({ resumo: resultado.resumo, modelo, largura, problemas: comProblema.map(p => ({ id: p.id, ms: p.msAteAssentar, achados: (p.achados || []).map(a => a.tipo + ':' + a.termo), console: (p.errosConsole || []).slice(0, 3), rede: (p.redeFalhas || []).slice(0, 3), lentas: (p.redeLentas || []).slice(0, 2), abas: (p.abas || []).filter(a => a.achados.length || a.errosConsole.length).map(a => a.aba + '=' + a.achados.map(x => x.tipo).join('/')) })) });
 })().catch(e => { window.__varreduraRodando = false; window.__varreduraProgresso = 'falhou: ' + e.message; });
